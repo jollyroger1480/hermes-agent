@@ -265,3 +265,84 @@ class TestBusyInputModeQueueFifo:
         assert head.media_urls == ["/tmp/a.jpg", "/tmp/b.jpg"]
         assert "first" in head.text and "second" in head.text
         assert runner._queue_depth(session_key, adapter=adapter) == 1
+
+
+class TestQueueAckDoesNotCountPhotoLeftovers:
+    """Bilge Rat said '(2 queued)' for one /queue album because extra photos of the
+    in-flight listing already occupied the pending slot. Ack must count /queue
+    slashes only; same-album bytes must merge, not overflow."""
+
+    def _make_runner_and_adapter(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        adapter = _StubAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        return runner, adapter
+
+    def _event(self, *, text, message_id, urls=None, mtype=MessageType.TEXT):
+        source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM, profile=None)
+        urls = list(urls or [])
+        return MessageEvent(
+            text=text,
+            message_type=mtype,
+            source=source,
+            message_id=message_id,
+            media_urls=urls,
+            media_types=["image/jpeg"] * len(urls),
+        )
+
+    def test_photo_leftover_plus_one_queue_album_acks_as_one(self):
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:ebay"
+        leftover = self._event(
+            text="", message_id="extras", urls=["/tmp/a.jpg"], mtype=MessageType.PHOTO,
+        )
+        album = self._event(
+            text="/queue /nos", message_id="help-13898",
+            urls=["/tmp/b.jpg", "/tmp/c.jpg"], mtype=MessageType.PHOTO,
+        )
+        runner._enqueue_fifo(session_key, leftover, adapter)
+        runner._enqueue_fifo(session_key, album, adapter)
+        assert runner._queue_depth(session_key, adapter=adapter) == 2
+        assert runner._queue_slash_depth(session_key, adapter=adapter) == 1
+        ack = "Queued for the next turn." + (
+            f" ({runner._queue_slash_depth(session_key, adapter=adapter)} queued)"
+            if runner._queue_slash_depth(session_key, adapter=adapter) > 1 else ""
+        )
+        assert ack == "Queued for the next turn."
+        assert "(2 queued)" not in ack
+
+    def test_two_real_queue_albums_still_say_two(self):
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:ebay"
+        first = self._event(
+            text="/queue /nos", message_id="hose", urls=["/tmp/h1.jpg"], mtype=MessageType.PHOTO,
+        )
+        second = self._event(
+            text="/queue /nos", message_id="bolts", urls=["/tmp/b1.jpg"], mtype=MessageType.PHOTO,
+        )
+        runner._enqueue_fifo(session_key, first, adapter)
+        runner._enqueue_fifo(session_key, second, adapter)
+        assert runner._queue_slash_depth(session_key, adapter=adapter) == 2
+        assert runner._queue_depth(session_key, adapter=adapter) == 2
+
+    def test_same_album_does_not_overflow(self):
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:ebay"
+        burst = self._event(
+            text="", message_id="mg-1", urls=["/tmp/x.jpg"], mtype=MessageType.PHOTO,
+        )
+        queued = self._event(
+            text="/queue /nos", message_id="mg-1-caption",
+            urls=["/tmp/x.jpg", "/tmp/y.jpg"], mtype=MessageType.PHOTO,
+        )
+        runner._enqueue_fifo(session_key, burst, adapter)
+        runner._enqueue_fifo(session_key, queued, adapter)
+        assert runner._queue_depth(session_key, adapter=adapter) == 1
+        assert runner._queue_slash_depth(session_key, adapter=adapter) == 1
+        head = adapter._pending_messages[session_key]
+        assert head.text == "/queue /nos"
+        assert head.media_urls == ["/tmp/x.jpg", "/tmp/y.jpg"]
+
+

@@ -81,6 +81,13 @@ class TestDecideImageInputMode:
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
             assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "native"
 
+    def test_image_input_mode_native_does_not_attach_to_non_vision_model(self):
+        """NVIDIA Super NIM rejects pixels (400 --enable-multimodal)."""
+        cfg = {"agent": {"image_input_mode": "native"}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=False):
+            assert decide_image_input_mode(
+                "nvidia", "nvidia/nemotron-3-super-120b-a12b", cfg
+            ) == "text"
 
     def test_none_config_is_auto(self):
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):

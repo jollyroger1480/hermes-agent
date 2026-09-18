@@ -85,11 +85,71 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
+    @staticmethod
+    def _fifo_same_item(existing: Any, incoming: Any) -> bool:
+        """True when incoming is the same Telegram item already in the FIFO (not a second album)."""
+        if existing is None or incoming is None or existing is incoming:
+            return existing is incoming
+        mid_a, mid_b = getattr(existing, "message_id", None), getattr(incoming, "message_id", None)
+        if mid_a and mid_b and str(mid_a) == str(mid_b):
+            return True
+        urls_a = {u for u in (getattr(existing, "media_urls", None) or []) if u}
+        urls_b = {u for u in (getattr(incoming, "media_urls", None) or []) if u}
+        return bool(urls_a and urls_b and urls_a & urls_b)
+
+    @staticmethod
+    def _is_queue_slash_event(event: Any) -> bool:
+        """True for an explicit /queue (or /q) turn — not a photo-burst leftover occupying the slot."""
+        if event is None:
+            return False
+        getter = getattr(event, "get_command", None)
+        cmd = getter() if callable(getter) else None
+        if cmd in ("queue", "q"):
+            return True
+        first = ((getattr(event, "text", None) or "").lstrip().split(maxsplit=1) or [""])[0].lower()
+        name = first[1:].split("@", 1)[0] if first.startswith("/") else ""
+        return name in ("queue", "q")
+
+    @staticmethod
+    def _merge_fifo_event(dst: Any, src: Any) -> None:
+        """Fold extra album frames / the /queue caption into an already-queued event."""
+        dst_urls = list(getattr(dst, "media_urls", None) or [])
+        dst_types = list(getattr(dst, "media_types", None) or [])
+        src_urls = list(getattr(src, "media_urls", None) or [])
+        src_types = list(getattr(src, "media_types", None) or [])
+        for i, url in enumerate(src_urls):
+            if not url or url in dst_urls:
+                continue
+            dst_urls.append(url)
+            dst_types.append(src_types[i] if i < len(src_types) else (dst_types[-1] if dst_types else "image/jpeg"))
+        dst.media_urls = dst_urls
+        dst.media_types = dst_types
+        src_text = (getattr(src, "text", None) or "").lstrip()
+        if src_text.startswith("/queue") or src_text.startswith("/q ") or src_text in ("/q", "/queue"):
+            dst.text = getattr(src, "text", None)
+            if getattr(src, "message_type", None) is not None:
+                dst.message_type = src.message_type
+
+    def _iter_fifo_events(self, session_key: str, *, adapter: Any = None):
+        """Pending slot (if any) then overflow, in drain order."""
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if isinstance(pending_slot, dict) and session_key in pending_slot:
+            head = pending_slot.get(session_key)
+            if head is not None:
+                yield head
+        overflow = self._overflow_queue(session_key) or ()
+        yield from overflow
+
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
             return
+        for existing in self._iter_fifo_events(session_key, adapter=adapter):
+            if self._fifo_same_item(existing, queued_event):
+                self._merge_fifo_event(existing, queued_event)
+                queued_event._gateway_accepted = True
+                return
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
@@ -115,11 +175,15 @@ class GatewayBusySessionMixin:
         return pending_event
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Total pending /queue items for a session — slot + overflow."""
+        """Total pending FIFO items for a session — slot + overflow (cap / drain)."""
         depth = len(self._overflow_queue(session_key) or ())
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
         return depth
+
+    def _queue_slash_depth(self, session_key: str, *, adapter: Any = None) -> int:
+        """User-facing /queue count. Photo-burst leftovers in the slot are not a second album."""
+        return sum(1 for event in self._iter_fifo_events(session_key, adapter=adapter) if self._is_queue_slash_event(event))
 
     def _rescue_orphaned_overflow(self, session_key: str, adapter: Any) -> Optional["MessageEvent"]:
         """Pop the oldest orphaned FIFO overflow event for an idle session (None if nothing to rescue).
@@ -1026,7 +1090,8 @@ class GatewayBusySessionMixin:
         adapter = self._delivery_adapter_for(source)
         if adapter:
             self._enqueue_fifo(quick_key, MessageEvent(
-                text=queued_text, message_type=event.message_type if has_media else MessageType.TEXT,
+                text=(f"/queue {queued_text}".strip() if queued_text else "/queue"),
+                message_type=event.message_type if has_media else MessageType.TEXT,
                 source=event.source, raw_message=event.raw_message, message_id=event.message_id,
                 media_urls=list(getattr(event, "media_urls", []) or []),
                 media_types=list(getattr(event, "media_types", []) or []),
@@ -1038,7 +1103,7 @@ class GatewayBusySessionMixin:
                 channel_prompt=event.channel_prompt, channel_context=event.channel_context,
                 internal=event.internal, timestamp=event.timestamp,
             ), adapter)
-        depth = self._queue_depth(quick_key, adapter=adapter)
+        depth = self._queue_slash_depth(quick_key, adapter=adapter)
         return "Queued for the next turn." + (f" ({depth} queued)" if depth > 1 else "")
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):

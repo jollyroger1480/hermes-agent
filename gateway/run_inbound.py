@@ -934,7 +934,14 @@ class GatewayInboundMixin:
     # /queue and /steer on the idle path: no agent is running, so strip the prefix and send the
     # payload as a regular user turn; an empty payload surfaces the usage hint.
     async def _hm_cmd_queue(self, event, source, _quick_key):
-        return self._hm_send_payload_as_turn(event, "Usage: /queue <prompt>")
+        payload = event.get_command_args().strip()
+        has_media = bool(getattr(event, "media_urls", None))
+        if not payload and not has_media:
+            return True, "Usage: /queue <prompt>"
+        with suppress(Exception):
+            # Keep "/queue" + caption so PHOTO_GATE still sees a listing draft.
+            event.text = f"/queue {payload}".strip() if payload else "/queue"
+        return False, None
 
     async def _hm_cmd_steer(self, event, source, _quick_key):
         return self._hm_send_payload_as_turn(
@@ -1458,11 +1465,28 @@ class GatewayInboundMixin:
         self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
-        # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
-        # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
-        _img_mode = await asyncio.to_thread(
-            self._decide_image_input_mode, source=source, session_key=session_key,
-        )
+        # Listing drafts (/nos + photos) skip native attach only:
+        # NVIDIA Super is text-only (NIM 400 --enable-multimodal).
+        # Aux vision_analyze is primary; RapidOCR SCAN_PN is failsafe.
+        _listing_draft = False
+        try:
+            from gateway.telegram_listing_locks import is_active_listing_draft
+
+            _listing_draft = is_active_listing_draft(message_text)
+        except Exception:
+            logger.debug("listing draft detect failed", exc_info=True)
+        if _listing_draft:
+            logger.info(
+                "Image routing: listing PHOTO_GATE. %d image(s) — skip native attach; aux vision_analyze; RapidOCR failsafe.",
+                len(image_paths),
+            )
+            _img_mode = "text"
+        else:
+            # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
+            # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
+            _img_mode = await asyncio.to_thread(
+                self._decide_image_input_mode, source=source, session_key=session_key,
+            )
         if _img_mode == "native":
             self._session_state(session_key).persistent.native_image_paths = list(image_paths)
             logger.info(
@@ -1722,6 +1746,32 @@ class GatewayInboundMixin:
             message_text = await self._expand_inbound_context_references(source, session_key, message_text)
             if message_text is None:
                 return None
+
+        # Machine land: mkdir/copy incoming under not-listed happens on disk here.
+        # Listing dollar lock + /nos+photos GATE.
+        try:
+            from gateway.telegram_incoming_land import apply_inbound_file_ops
+
+            message_text = apply_inbound_file_ops(message_text or "", image_paths)
+        except Exception:
+            logger.exception("telegram incoming land failed")
+
+        try:
+            from gateway.telegram_listing_locks import apply_inbound_listing_locks
+
+            if image_paths:
+                message_text = await asyncio.to_thread(
+                    apply_inbound_listing_locks,
+                    message_text or "",
+                    image_paths,
+                )
+            else:
+                message_text = apply_inbound_listing_locks(
+                    message_text or "", image_paths
+                )
+        except Exception:
+            logger.exception("telegram listing lock parse failed")
+
         # After expansion: the quoted reply is someone else's text and stays literal — an
         # ``@file:`` inside it must never read a local file on the replier's behalf.
         return self._prepend_inbound_reply_context(event, source, message_text)

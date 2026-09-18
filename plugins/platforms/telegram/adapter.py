@@ -73,6 +73,21 @@ async def _await_with_thread_deadline(
     return result.value
 
 
+def _should_drop_pending_updates(*, is_reconnect: bool = False) -> bool:
+    """Never drop the Bot API queue unless the operator opts in.
+
+    Cold-boot and 409-conflict recovery used ``drop_pending_updates=True`` to kick a zombie
+    getUpdates session. That also discarded DMs queued while the previous gateway was wedged
+    (T2 / Corey 2026-09-11). Session expiry is the wait in ``_handle_polling_conflict``, not a
+    queue flush. Opt-in flush: ``TELEGRAM_DROP_PENDING_UPDATES=1`` (cold boot only; reconnects
+    still preserve, matching #46621).
+    """
+    raw = (os.getenv("TELEGRAM_DROP_PENDING_UPDATES") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return not is_reconnect
+    return False
+
+
 def _iter_exception_graph(error: BaseException) -> "Iterator[BaseException]":
     """Yield ``error`` and every ``__cause__``/``__context__`` ancestor (DFS, cycle-safe) —
     PTB wraps httpx errors, so classifiers must inspect the whole graph."""
@@ -2485,15 +2500,12 @@ class TelegramAdapter(BasePlatformAdapter):
             expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True makes Telegram terminate any other getUpdates session for this
-            # token (zombie or our own prior retry); without it each retry is immediately 409'd.
-            # The competing session is either a zombie from the previous gateway process (whose long-poll
-            # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
-            # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
-            # one, creating the very conflict we are trying to recover from (#75017).
+            # Wait (15–55s) is what lets Telegram expire the zombie getUpdates session.
+            # drop_pending_updates=True also flushed DMs queued while the previous process was
+            # wedged (T2/Corey 2026-09-11). Do not drop the queue to recover from 409 (#75017 wait ladder).
             self._polling_conflict_recovery_generation = expected_generation
             try:
-                await self._start_polling_once(app, drop_pending_updates=True, error_callback=self._polling_error_callback_ref)
+                await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
                 logger.info(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
@@ -6577,6 +6589,20 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # -- Photo batching --
 
+    @staticmethod
+    def _telegram_photo_album_key(msg) -> str:
+        """Stable cache-folder key: media_group_id (album) or message_id (single)."""
+        gid = getattr(msg, "media_group_id", None)
+        if gid:
+            return f"mg{gid}"
+        mid = getattr(msg, "message_id", None)
+        return f"msg{mid}" if mid is not None else "msgunknown"
+
+    async def _cache_telegram_photo_bytes(self, msg, image_bytes, ext: str) -> str:
+        """Write this photo into its timestamped album folder (not the flat img_* pile)."""
+        return await cache_image_from_bytes_async(
+            bytes(image_bytes), ext=ext, album_key=self._telegram_photo_album_key(msg))
+
     def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
         """Return a batching key for Telegram photos/albums."""
         session_key = self._event_session_key(event)
@@ -6695,7 +6721,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 image_bytes = await file_obj.download_as_bytearray()
                 image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                 try:
-                    cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=image_ext)
+                    cached_path = await self._cache_telegram_photo_bytes(msg, image_bytes, image_ext)
                 except ValueError as e:
                     logger.warning("[Telegram] Failed to cache image document: %s", _redact_telegram_error_text(e), exc_info=True)
                     return await self._dispatch_with_text(event, f"Image document '{display}' could not be read as an image.")
@@ -6787,7 +6813,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 image_bytes = await file_obj.download_as_bytearray()
                 ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
                 self._set_cached_media(
-                    event, await cache_image_from_bytes_async(bytes(image_bytes), ext=ext), f"image/{ext.lstrip('.')}", event.message_type,
+                    event, await self._cache_telegram_photo_bytes(msg, image_bytes, ext), f"image/{ext.lstrip('.')}", event.message_type,
                     "[Telegram] Cached user photo at %s")
                 await self._route_photo_event(msg, event)
                 return

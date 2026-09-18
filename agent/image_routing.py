@@ -378,13 +378,20 @@ def decide_image_input_mode(
     """Return ``"native"`` or ``"text"`` for the given turn (``cfg`` None behaves as
     auto; ``requested_provider`` is the identity before runtime canonicalization)."""
     mode_cfg = _coerce_mode(_dict_or_empty(_dict_or_empty(cfg).get("agent")).get("image_input_mode"))
-    if mode_cfg != "auto":
-        return mode_cfg
-    if _explicit_aux_vision_override(cfg):  # auto: an explicit auxiliary.vision backend wins
-        return "text"
-    # Keep the three-argument call contract for callers/tests that replace the lookup hook.
     extra = {"requested_provider": requested_provider} if requested_provider else {}
-    return "native" if _lookup_supports_vision(provider, model, cfg, **extra) is True else "text"
+    # ``agent.image_input_mode: native`` is the escape hatch versus a configured
+    # aux backend — it does not attach pixels to a model that reports
+    # ``supports_vision: false`` (NVIDIA Super NIM 400 --enable-multimodal).
+    if mode_cfg == "text":
+        return "text"
+    if mode_cfg == "auto" and _explicit_aux_vision_override(cfg):
+        return "text"
+    supports = _lookup_supports_vision(provider, model, cfg, **extra)
+    if mode_cfg == "native":
+        if supports is False:
+            return "text"
+        return "native"
+    return "native" if supports is True else "text"
 
 
 # Image size handling is REACTIVE: attach at full size and let

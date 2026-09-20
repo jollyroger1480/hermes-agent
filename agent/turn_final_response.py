@@ -187,6 +187,17 @@ def finish_text_response(
         messages=messages,
         continuations_used=codex_ack_continuations,
     )
+    # Degenerate-final guard (#103483): the turn did real tool work and then stopped on a
+    # fragment. Same scope knob and the SAME bounded counter as the ack continuation; the nudge
+    # row itself closes the tool-work window, so a second fragment ends the turn as the answer.
+    _tool_rows = tool_results_this_turn(messages)
+    _degenerate_final = (
+        bool(getattr(agent, "_stall_guards", True))
+        and _ack_mode != "off"
+        and codex_ack_continuations < 2
+        and _tool_rows > 0
+        and looks_like_degenerate_final(_stall_text, user_message=user_message)
+    )
     if _stall_continue_intent:
         _continuation_kind = "stall"
     elif _degenerate_final:
